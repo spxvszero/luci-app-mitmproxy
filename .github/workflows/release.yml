@@ -88,7 +88,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          package_dir="$sdk_dir/package/feeds/local_mitmproxy/$PACKAGE_NAME"
+          package_dir="$sdk_dir/package/local_mitmproxy/$PACKAGE_NAME"
           mkdir -p "$package_dir"
           rsync -a --delete \
             --exclude='.git' \
@@ -98,11 +98,11 @@ jobs:
             --exclude='openwrt-sdk-*' \
             "$GITHUB_WORKSPACE/" "$package_dir/"
 
-          test -f "package/feeds/local_mitmproxy/$PACKAGE_NAME/Makefile"
+          test -f "package/local_mitmproxy/$PACKAGE_NAME/Makefile"
           rm -rf tmp
           echo "CONFIG_PACKAGE_${PACKAGE_NAME}=m" >> .config
           make defconfig
-          make "package/feeds/local_mitmproxy/$PACKAGE_NAME/compile" V=s
+          make "package/local_mitmproxy/$PACKAGE_NAME/compile" V=s
 
           out_dir="$GITHUB_WORKSPACE/dist/${{ matrix.label }}"
           mkdir -p "$out_dir"
