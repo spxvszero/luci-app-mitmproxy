@@ -84,7 +84,8 @@ jobs:
       - name: Build package
         run: |
           set -eu
-          package_dir="$sdk_dir/package/$PACKAGE_NAME"
+          feed_dir="$RUNNER_TEMP/local-feed-${{ matrix.label }}"
+          package_dir="$feed_dir/$PACKAGE_NAME"
           mkdir -p "$package_dir"
           rsync -a --delete \
             --exclude='.git' \
@@ -95,12 +96,14 @@ jobs:
             "$GITHUB_WORKSPACE/" "$package_dir/"
 
           cd "$sdk_dir"
+          printf '\nsrc-link local_mitmproxy %s\n' "$feed_dir" >> feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          test -f "package/feeds/local_mitmproxy/$PACKAGE_NAME/Makefile"
           echo "CONFIG_PACKAGE_${PACKAGE_NAME}=m" >> .config
           make defconfig
           grep -q "^CONFIG_PACKAGE_${PACKAGE_NAME}=m$" .config
-          make "package/$PACKAGE_NAME/compile" V=s
+          make "package/feeds/local_mitmproxy/$PACKAGE_NAME/compile" V=s
 
           out_dir="$GITHUB_WORKSPACE/dist/${{ matrix.label }}"
           mkdir -p "$out_dir"
