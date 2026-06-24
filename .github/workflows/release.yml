@@ -84,8 +84,11 @@ jobs:
       - name: Build package
         run: |
           set -eu
-          feed_dir="$RUNNER_TEMP/local-feed-${{ matrix.label }}"
-          package_dir="$feed_dir/$PACKAGE_NAME"
+          cd "$sdk_dir"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          package_dir="$sdk_dir/package/feeds/local_mitmproxy/$PACKAGE_NAME"
           mkdir -p "$package_dir"
           rsync -a --delete \
             --exclude='.git' \
@@ -95,11 +98,8 @@ jobs:
             --exclude='openwrt-sdk-*' \
             "$GITHUB_WORKSPACE/" "$package_dir/"
 
-          cd "$sdk_dir"
-          printf '\nsrc-link local_mitmproxy %s\n' "$feed_dir" >> feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
           test -f "package/feeds/local_mitmproxy/$PACKAGE_NAME/Makefile"
+          rm -rf tmp
           echo "CONFIG_PACKAGE_${PACKAGE_NAME}=m" >> .config
           make defconfig
           grep -q "^CONFIG_PACKAGE_${PACKAGE_NAME}=m$" .config
