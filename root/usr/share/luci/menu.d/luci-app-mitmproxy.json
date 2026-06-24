@@ -1,0 +1,45 @@
+{
+	"admin/services/mitmproxy": {
+		"title": "mitmproxy",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "mitmproxy/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-mitmproxy" ]
+		}
+	},
+	"admin/services/mitmproxy/status": {
+		"title": "Status",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "mitmproxy/status"
+		}
+	},
+	"admin/services/mitmproxy/targets": {
+		"title": "Targets",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "mitmproxy/targets"
+		}
+	},
+	"admin/services/mitmproxy/certificates": {
+		"title": "Certificates",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "mitmproxy/certificates"
+		}
+	},
+	"admin/services/mitmproxy/rules": {
+		"title": "Rules",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "mitmproxy/rules"
+		}
+	}
+}

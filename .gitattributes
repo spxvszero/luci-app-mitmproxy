@@ -1,0 +1,11 @@
+* text=auto
+
+Makefile text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+root/** text eol=lf
+htdocs/** text eol=lf
+.github/workflows/** text eol=lf

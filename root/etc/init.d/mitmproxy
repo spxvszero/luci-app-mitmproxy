@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+is_enabled() {
+	[ "$(uci -q get mitmproxy.main.enabled 2>/dev/null)" = "1" ]
+}
+
+start_service() {
+	is_enabled || return 0
+	/usr/sbin/mitmproxyctl start >/dev/null
+}
+
+stop_service() {
+	/usr/sbin/mitmproxyctl stop >/dev/null
+}
+
+reload_service() {
+	/usr/sbin/mitmproxyctl apply-rules >/dev/null
+}

@@ -1,0 +1,62 @@
+#!/bin/sh
+
+if [ ! -f /etc/config/mitmproxy ]; then
+	cat > /etc/config/mitmproxy <<'EOF'
+config mitmproxy 'main'
+	option enabled '0'
+	option image 'mitmproxy/mitmproxy'
+	option container_name 'mitmproxy'
+	option confdir '/etc/mitmproxy'
+	option listen_host '0.0.0.0'
+	option listen_port '8080'
+	option web_host '0.0.0.0'
+	option web_port '8081'
+	option web_password ''
+	option intercept_http '1'
+	option intercept_https '1'
+	option block_quic '1'
+	option ipv6_enabled '0'
+	option rules_enabled '0'
+	option last_error ''
+	list interface 'br-lan'
+	list exclude_cidr '127.0.0.0/8'
+	list exclude_cidr6 '::1/128'
+	list exclude_cidr6 'fe80::/10'
+EOF
+fi
+
+if [ -f /etc/config/mitmproxy ]; then
+	uci -q get mitmproxy.main.ipv6_enabled >/dev/null 2>&1 || uci -q set mitmproxy.main.ipv6_enabled='0'
+	if [ -z "$(uci -q get mitmproxy.main.exclude_cidr6 2>/dev/null)" ]; then
+		uci -q add_list mitmproxy.main.exclude_cidr6='::1/128'
+		uci -q add_list mitmproxy.main.exclude_cidr6='fe80::/10'
+	fi
+	uci -q commit mitmproxy
+fi
+
+generate_web_password() {
+	dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"' 2>/dev/null
+}
+
+web_password="$(uci -q get mitmproxy.main.web_password 2>/dev/null)"
+if [ -f /etc/config/mitmproxy ] && [ -z "$web_password" ]; then
+	web_password="$(generate_web_password)"
+	[ -n "$web_password" ] || web_password="mitm$(date +%s)$$"
+	uci -q set mitmproxy.main.web_password="$web_password"
+	uci -q commit mitmproxy
+fi
+
+mkdir -p /etc/mitmproxy
+chmod 700 /etc/mitmproxy
+
+mkdir -p /www/mitmproxy-ca
+cat > /www/mitmproxy-ca/README <<'EOF'
+Public mitmproxy CA certificates will appear here after mitmproxy has started.
+Private CA key material is never published from this directory.
+EOF
+
+[ -f /usr/sbin/mitmproxyctl ] && chmod 755 /usr/sbin/mitmproxyctl
+[ -f /etc/init.d/mitmproxy ] && chmod 755 /etc/init.d/mitmproxy
+rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/*mitmproxy* 2>/dev/null || true
+
+exit 0

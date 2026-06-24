@@ -1,0 +1,27 @@
+{
+	"luci-app-mitmproxy": {
+		"description": "Grant access to LuCI mitmproxy app",
+		"read": {
+			"uci": [ "mitmproxy", "network", "dhcp" ],
+			"ubus": {
+				"file": [ "exec", "read" ],
+				"network.device": [ "status" ],
+				"network.interface": [ "dump" ]
+			},
+			"file": {
+				"/usr/sbin/mitmproxyctl": [ "exec" ],
+				"/www/mitmproxy-ca/*": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "mitmproxy" ],
+			"ubus": {
+				"file": [ "exec" ],
+				"service": [ "list", "set" ]
+			},
+			"file": {
+				"/usr/sbin/mitmproxyctl": [ "exec" ]
+			}
+		}
+	}
+}

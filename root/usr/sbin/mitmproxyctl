@@ -1,0 +1,2060 @@
+#!/bin/sh
+
+CONFIG=mitmproxy
+PACKAGE_NAME=luci-app-mitmproxy
+PACKAGE_VERSION=0.4.0-1
+RULE_DIR=/etc/nftables.d
+RULE_FILE=$RULE_DIR/mitmproxy.nft
+TMP_FILE=$RULE_FILE.$$
+BAK_FILE=$RULE_FILE.bak
+PUBLIC_CERT_DIR=/www/mitmproxy-ca
+
+ERR=
+APPLY_RESULT=0
+APPLY_CONTAINER_STARTED=0
+APPLY_CONTAINER_REBUILT=0
+
+one_line() {
+	printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/  */ /g; s/^ //; s/ $//'
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+}
+
+json_bool() {
+	if [ "$1" = "1" ] || [ "$1" = "true" ]; then
+		printf true
+	else
+		printf false
+	fi
+}
+
+normalize_bool() {
+	case "$1" in
+		1|true|yes|on|enabled) printf 1 ;;
+		*) printf 0 ;;
+	esac
+}
+
+normalize_quic_policy() {
+	case "$1" in
+		''|inherit) printf inherit ;;
+		block) printf block ;;
+		allow) printf allow ;;
+		*) return 1 ;;
+	esac
+}
+
+global_block_quic() {
+	normalize_bool "$(uci_get main block_quic 1)"
+}
+
+package_version() {
+	local version
+
+	if command -v opkg >/dev/null 2>&1; then
+		version="$(opkg list-installed "$PACKAGE_NAME" 2>/dev/null | sed -n "s/^$PACKAGE_NAME - //p" | head -n 1)"
+		if [ -n "$version" ]; then
+			printf '%s' "$version"
+			return 0
+		fi
+	fi
+
+	printf '%s' "$PACKAGE_VERSION"
+}
+
+target_quic_policy() {
+	local section="$1" policy
+
+	policy="$(uci_get "$section" quic_policy inherit)"
+	normalize_quic_policy "$policy"
+}
+
+target_effective_block_quic() {
+	local policy
+
+	policy="$(target_quic_policy "$1")" || return 1
+	case "$policy" in
+		block) printf 1 ;;
+		allow) printf 0 ;;
+		*) global_block_quic ;;
+	esac
+}
+
+error_json() {
+	printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$(one_line "$1")")"
+}
+
+set_last_error() {
+	ERR="$(one_line "$1")"
+	if command -v uci >/dev/null 2>&1; then
+		uci -q set "$CONFIG.main.last_error=$ERR" 2>/dev/null
+		uci -q commit "$CONFIG" 2>/dev/null
+	fi
+}
+
+clear_last_error() {
+	ERR=
+	if command -v uci >/dev/null 2>&1; then
+		uci -q set "$CONFIG.main.last_error=" 2>/dev/null
+		uci -q commit "$CONFIG" 2>/dev/null
+	fi
+}
+
+uci_get() {
+	local section="$1" option="$2" default="$3" value
+
+	if command -v uci >/dev/null 2>&1; then
+		value="$(uci -q get "$CONFIG.$section.$option" 2>/dev/null)" || value=
+	fi
+
+	[ -n "$value" ] || value="$default"
+	printf '%s' "$value"
+}
+
+uci_get_list() {
+	local section="$1" option="$2" value
+
+	if command -v uci >/dev/null 2>&1; then
+		value="$(uci -q get "$CONFIG.$section.$option" 2>/dev/null)" || value=
+	fi
+
+	printf '%s' "$value"
+}
+
+uci_set_main() {
+	uci -q set "$CONFIG.main.$1=$2" 2>/dev/null
+}
+
+uci_commit() {
+	uci -q commit "$CONFIG" 2>/dev/null
+}
+
+target_sections() {
+	command -v uci >/dev/null 2>&1 || return 0
+	uci -q show "$CONFIG" 2>/dev/null | sed -n "s/^$CONFIG\.\([^.=]*\)=target$/\1/p"
+}
+
+section_exists() {
+	local wanted="$1" section
+
+	for section in $(target_sections); do
+		[ "$section" = "$wanted" ] && return 0
+	done
+
+	return 1
+}
+
+is_ipv4() {
+	local ip="$1" oldifs oct
+
+	case "$ip" in
+		''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+	esac
+
+	oldifs=$IFS
+	IFS=.
+	set -- $ip
+	IFS=$oldifs
+
+	[ $# -eq 4 ] || return 1
+
+	for oct in "$@"; do
+		case "$oct" in
+			''|*[!0-9]*) return 1 ;;
+		esac
+		[ "$oct" -le 255 ] 2>/dev/null || return 1
+	done
+
+	return 0
+}
+
+is_cidr() {
+	local cidr="$1" ip mask
+
+	case "$cidr" in
+		*/*) ;;
+		*) return 1 ;;
+	esac
+
+	ip=${cidr%/*}
+	mask=${cidr#*/}
+
+	case "$mask" in
+		''|*[!0-9]*|*/*) return 1 ;;
+	esac
+
+	is_ipv4 "$ip" || return 1
+	[ "$mask" -ge 0 ] 2>/dev/null && [ "$mask" -le 32 ] 2>/dev/null
+}
+
+is_ipv6() {
+	local ip="$1" compacted groups
+
+	case "$ip" in
+		''|*/*|*%*|*[!0-9A-Fa-f:.]*|*:::*) return 1 ;;
+	esac
+
+	case "$ip" in
+		*:*) ;;
+		*) return 1 ;;
+	esac
+
+	case "$ip" in
+		:*) case "$ip" in ::*) ;; *) return 1 ;; esac ;;
+	esac
+
+	case "$ip" in
+		*:) case "$ip" in *::) ;; *) return 1 ;; esac ;;
+	esac
+
+	[ "$(printf '%s' "$ip" | awk -F'::' '{ print NF - 1 }')" -le 1 ] 2>/dev/null || return 1
+
+	case "$ip" in
+		*.*)
+			is_ipv4 "${ip##*:}" || return 1
+			compacted="$(printf '%s' "$ip" | sed 's/[^:]//g')"
+			[ "${#compacted}" -le 7 ] 2>/dev/null || return 1
+			;;
+		*)
+			groups="$(printf '%s' "$ip" | awk -F: '{ c=0; for (i=1; i<=NF; i++) if ($i != "") c++; print c }')"
+			[ "$groups" -le 8 ] 2>/dev/null || return 1
+			;;
+	esac
+
+	return 0
+}
+
+is_cidr6() {
+	local cidr="$1" ip mask
+
+	case "$cidr" in
+		*/*) ;;
+		*) return 1 ;;
+	esac
+
+	ip=${cidr%/*}
+	mask=${cidr#*/}
+
+	case "$mask" in
+		''|*[!0-9]*|*/*) return 1 ;;
+	esac
+
+	is_ipv6 "$ip" || return 1
+	[ "$mask" -ge 0 ] 2>/dev/null && [ "$mask" -le 128 ] 2>/dev/null
+}
+
+value_family() {
+	local value="$1"
+
+	if is_ipv4 "$value" || is_cidr "$value"; then
+		printf ipv4
+		return 0
+	fi
+
+	if is_ipv6 "$value" || is_cidr6 "$value"; then
+		printf ipv6
+		return 0
+	fi
+
+	return 1
+}
+
+family_version() {
+	case "$1" in
+		ipv4) printf 4 ;;
+		ipv6) printf 6 ;;
+		*) printf 0 ;;
+	esac
+}
+
+is_port() {
+	local port="$1"
+
+	case "$port" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null
+}
+
+is_interface_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+	return 0
+}
+
+is_safe_image() {
+	case "$1" in
+		''|-*|*[!A-Za-z0-9_./:@-]*) return 1 ;;
+	esac
+	return 0
+}
+
+is_safe_container_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.-]*) return 1 ;;
+	esac
+	return 0
+}
+
+is_safe_path() {
+	case "$1" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+
+	case "$1" in
+		*[!A-Za-z0-9_./:-]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+is_safe_web_password() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+
+	[ "${#1}" -ge 8 ] 2>/dev/null && [ "${#1}" -le 128 ] 2>/dev/null
+}
+
+is_safe_ignore_host() {
+	local value="$1"
+
+	[ -n "$value" ] || return 1
+	[ "${#value}" -le 256 ] 2>/dev/null || return 1
+	printf '%s' "$value" | grep -Eq '^[A-Za-z0-9_.*?+^$|()/{}:.,\\-]+$'
+}
+
+generate_web_password() {
+	local password
+
+	password="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"' 2>/dev/null)"
+	if [ -z "$password" ]; then
+		password="mitm$(date +%s)$$"
+	fi
+
+	printf '%s' "$password"
+}
+
+ensure_web_password() {
+	local password
+
+	password="$(uci_get main web_password '')"
+	if [ -n "$password" ]; then
+		is_safe_web_password "$password" || { set_last_error "Invalid mitmweb password value"; return 1; }
+		return 0
+	fi
+
+	password="$(generate_web_password)"
+	is_safe_web_password "$password" || { set_last_error "Failed to generate mitmweb password"; return 1; }
+	uci_set_main web_password "$password"
+	uci_commit
+	return 0
+}
+
+is_host() {
+	is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+configured_interfaces() {
+	uci_get_list main interface
+}
+
+configured_excludes() {
+	uci_get_list main exclude_cidr
+}
+
+configured_excludes6() {
+	uci_get_list main exclude_cidr6
+}
+
+configured_ignore_hosts() {
+	uci_get_list main ignore_host
+}
+
+ipv6_enabled() {
+	normalize_bool "$(uci_get main ipv6_enabled 0)"
+}
+
+runtime_listen_host() {
+	local listen_host
+
+	listen_host="$(uci_get main listen_host 0.0.0.0)"
+	if [ "$(ipv6_enabled)" = "1" ] && [ "$listen_host" = "0.0.0.0" ]; then
+		printf '::'
+	else
+		printf '%s' "$listen_host"
+	fi
+}
+
+count_words() {
+	local count=0 item
+
+	for item in $1; do
+		count=$((count + 1))
+	done
+
+	printf '%s' "$count"
+}
+
+validate_main_config() {
+	local image container_name confdir listen_host listen_port web_host web_port web_password iface cidr host
+
+	image="$(uci_get main image mitmproxy/mitmproxy)"
+	container_name="$(uci_get main container_name mitmproxy)"
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	listen_host="$(uci_get main listen_host 0.0.0.0)"
+	listen_port="$(uci_get main listen_port 8080)"
+	web_host="$(uci_get main web_host 0.0.0.0)"
+	web_port="$(uci_get main web_port 8081)"
+	ensure_web_password || return 1
+	web_password="$(uci_get main web_password '')"
+
+	is_safe_image "$image" || { set_last_error "Invalid Docker image value"; return 1; }
+	is_safe_container_name "$container_name" || { set_last_error "Invalid container name"; return 1; }
+	is_safe_path "$confdir" || { set_last_error "Invalid mitmproxy config directory"; return 1; }
+	is_host "$listen_host" || { set_last_error "Invalid listen_host value"; return 1; }
+	is_host "$web_host" || { set_last_error "Invalid web_host value"; return 1; }
+	is_port "$listen_port" || { set_last_error "Invalid listen_port value"; return 1; }
+	is_port "$web_port" || { set_last_error "Invalid web_port value"; return 1; }
+	is_safe_web_password "$web_password" || { set_last_error "Invalid mitmweb password value"; return 1; }
+
+	for iface in $(configured_interfaces); do
+		is_interface_name "$iface" || { set_last_error "Invalid interface: $iface"; return 1; }
+	done
+
+	for cidr in $(configured_excludes); do
+		is_cidr "$cidr" || is_ipv4 "$cidr" || { set_last_error "Invalid exclude_cidr: $cidr"; return 1; }
+	done
+
+	for cidr in $(configured_excludes6); do
+		is_cidr6 "$cidr" || is_ipv6 "$cidr" || { set_last_error "Invalid exclude_cidr6: $cidr"; return 1; }
+	done
+
+	for host in $(configured_ignore_hosts); do
+		is_safe_ignore_host "$host" || { set_last_error "Invalid ignore_host: $host"; return 1; }
+	done
+
+	return 0
+}
+
+ensure_confdir() {
+	local confdir
+
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	mkdir -p "$confdir" || { set_last_error "Failed to create config directory: $confdir"; return 1; }
+	chmod 700 "$confdir" 2>/dev/null
+	return 0
+}
+
+sync_public_certs() {
+	local confdir name src dst
+
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	mkdir -p "$PUBLIC_CERT_DIR" 2>/dev/null
+
+	if [ ! -f "$PUBLIC_CERT_DIR/README" ]; then
+		cat > "$PUBLIC_CERT_DIR/README" <<'EOF' 2>/dev/null
+Public mitmproxy CA certificates will appear here after mitmproxy has started.
+Private CA key material is never published from this directory.
+EOF
+	fi
+
+	for name in mitmproxy-ca-cert.pem mitmproxy-ca-cert.cer; do
+		src="$confdir/$name"
+		dst="$PUBLIC_CERT_DIR/$name"
+		if [ -f "$src" ]; then
+			cp -f "$src" "$dst" 2>/dev/null && chmod 644 "$dst" 2>/dev/null
+		fi
+	done
+}
+
+file_sha256() {
+	local file="$1"
+
+	[ -f "$file" ] || return 0
+	command -v sha256sum >/dev/null 2>&1 || return 0
+	sha256sum "$file" 2>/dev/null | awk '{ print $1 }'
+}
+
+public_cert_path() {
+	local name="$1" confdir
+
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	if [ -f "$PUBLIC_CERT_DIR/$name" ]; then
+		printf '%s' "$PUBLIC_CERT_DIR/$name"
+	elif [ -f "$confdir/$name" ]; then
+		printf '%s' "$confdir/$name"
+	fi
+}
+
+primary_cert_json() {
+	local name path url sha
+
+	for name in mitmproxy-ca-cert.cer mitmproxy-ca-cert.pem; do
+		path="$(public_cert_path "$name")"
+		[ -n "$path" ] || continue
+		url="/mitmproxy-ca/$name"
+		sha="$(file_sha256 "$path")"
+		printf '{"name":"%s","path":"%s","url":"%s","sha256":"%s"}' \
+			"$(json_escape "$name")" \
+			"$(json_escape "$path")" \
+			"$(json_escape "$url")" \
+			"$(json_escape "$sha")"
+		return 0
+	done
+
+	return 1
+}
+
+public_files_json() {
+	local name first=1 path url sha
+
+	sync_public_certs >/dev/null 2>&1
+
+	for name in mitmproxy-ca-cert.pem mitmproxy-ca-cert.cer; do
+		path="$(public_cert_path "$name")"
+		[ -n "$path" ] || continue
+
+		url="/mitmproxy-ca/$name"
+		sha="$(file_sha256 "$path")"
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"name":"%s","path":"%s","url":"%s","sha256":"%s"}' \
+			"$(json_escape "$name")" \
+			"$(json_escape "$path")" \
+			"$(json_escape "$url")" \
+			"$(json_escape "$sha")"
+	done
+}
+
+certs_generated() {
+	local confdir
+
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	[ -f "$confdir/mitmproxy-ca-cert.pem" ] || \
+	[ -f "$confdir/mitmproxy-ca-cert.cer" ] || \
+	[ -f "$PUBLIC_CERT_DIR/mitmproxy-ca-cert.pem" ] || \
+	[ -f "$PUBLIC_CERT_DIR/mitmproxy-ca-cert.cer" ]
+}
+
+container_exists() {
+	local name
+
+	name="$(uci_get main container_name mitmproxy)"
+	command -v docker >/dev/null 2>&1 || return 1
+	docker inspect "$name" >/dev/null 2>&1
+}
+
+container_running() {
+	local name
+
+	name="$(uci_get main container_name mitmproxy)"
+	command -v docker >/dev/null 2>&1 || return 1
+	[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]
+}
+
+container_image() {
+	local name image
+
+	name="$(uci_get main container_name mitmproxy)"
+	image="$(uci_get main image mitmproxy/mitmproxy)"
+
+	if command -v docker >/dev/null 2>&1 && container_exists; then
+		docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || printf '%s' "$image"
+	else
+		printf '%s' "$image"
+	fi
+}
+
+cmd_has_arg_pair() {
+	local lines="$1" key="$2" value="$3" expect=0 line
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [ "$expect" = "1" ]; then
+			[ "$line" = "$value" ] && return 0
+			expect=0
+		fi
+
+		[ "$line" = "$key" ] && expect=1
+	done <<EOF
+$lines
+EOF
+
+	return 1
+}
+
+container_matches_runtime_config() {
+	local name image listen_host listen_port web_host web_port password cmd_lines host configured_count actual_count
+
+	name="$(uci_get main container_name mitmproxy)"
+	image="$(uci_get main image mitmproxy/mitmproxy)"
+	listen_host="$(runtime_listen_host)"
+	listen_port="$(uci_get main listen_port 8080)"
+	web_host="$(uci_get main web_host 0.0.0.0)"
+	web_port="$(uci_get main web_port 8081)"
+	password="$(uci_get main web_password '')"
+	[ -n "$password" ] || return 1
+	command -v docker >/dev/null 2>&1 || return 1
+	container_exists || return 1
+
+	[ "$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null)" = "$image" ] || return 1
+
+	cmd_lines="$(docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' "$name" 2>/dev/null)" || return 1
+
+	cmd_has_arg_pair "$cmd_lines" --listen-host "$listen_host" || return 1
+	cmd_has_arg_pair "$cmd_lines" --listen-port "$listen_port" || return 1
+	cmd_has_arg_pair "$cmd_lines" --web-host "$web_host" || return 1
+	cmd_has_arg_pair "$cmd_lines" --web-port "$web_port" || return 1
+	printf '%s\n' "$cmd_lines" | grep -F -x -q "web_password=$password" || return 1
+
+	configured_count="$(count_words "$(configured_ignore_hosts)")"
+	actual_count="$(printf '%s\n' "$cmd_lines" | grep -c '^ignore_hosts=')" || actual_count=0
+	[ "$configured_count" = "$actual_count" ] || return 1
+
+	for host in $(configured_ignore_hosts); do
+		printf '%s\n' "$cmd_lines" | grep -F -x -q "ignore_hosts=$host" || return 1
+	done
+
+	docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name" 2>/dev/null | \
+		grep -F -x -q "PYTHONUNBUFFERED=1"
+}
+
+enabled_target_count() {
+	local count=0 section enabled
+
+	for section in $(target_sections); do
+		enabled="$(normalize_bool "$(uci_get "$section" enabled 0)")"
+		[ "$enabled" = "1" ] && count=$((count + 1))
+	done
+
+	printf '%s' "$count"
+}
+
+enabled_target_count_by_family() {
+	local wanted="$1" count=0 section enabled type value family
+
+	for section in $(target_sections); do
+		enabled="$(normalize_bool "$(uci_get "$section" enabled 0)")"
+		[ "$enabled" = "1" ] || continue
+
+		type="$(uci_get "$section" type ip)"
+		case "$type" in
+			ip) value="$(uci_get "$section" ip '')" ;;
+			cidr) value="$(uci_get "$section" cidr '')" ;;
+			*) value= ;;
+		esac
+
+		family="$(value_family "$value")" || family=unknown
+		[ "$family" = "$wanted" ] && count=$((count + 1))
+	done
+
+	printf '%s' "$count"
+}
+
+effective_quic_target_count() {
+	local count=0 section enabled effective
+
+	for section in $(target_sections); do
+		enabled="$(normalize_bool "$(uci_get "$section" enabled 0)")"
+		[ "$enabled" = "1" ] || continue
+		effective="$(target_effective_block_quic "$section")" || effective="$(global_block_quic)"
+		[ "$effective" = "1" ] && count=$((count + 1))
+	done
+
+	printf '%s' "$count"
+}
+
+effective_quic_target_count_by_family() {
+	local wanted="$1" count=0 section enabled type value family effective
+
+	for section in $(target_sections); do
+		enabled="$(normalize_bool "$(uci_get "$section" enabled 0)")"
+		[ "$enabled" = "1" ] || continue
+
+		type="$(uci_get "$section" type ip)"
+		case "$type" in
+			ip) value="$(uci_get "$section" ip '')" ;;
+			cidr) value="$(uci_get "$section" cidr '')" ;;
+			*) value= ;;
+		esac
+
+		family="$(value_family "$value")" || family=unknown
+		[ "$family" = "$wanted" ] || continue
+
+		effective="$(target_effective_block_quic "$section")" || effective="$(global_block_quic)"
+		[ "$effective" = "1" ] && count=$((count + 1))
+	done
+
+	printf '%s' "$count"
+}
+
+status_json() {
+	local enabled docker_available fw4_available exists running image listen_port web_port web_password web_password_set
+	local rules_enabled rules_exists target_count target_count_v4 target_count_v6 quic_target_count quic_target_count_v4 quic_target_count_v6
+	local block_quic_default interface_count ignore_host_count exclude_cidr6_count last_error cert_generated ipv6_status version
+
+	ensure_web_password >/dev/null 2>&1
+	sync_public_certs >/dev/null 2>&1
+
+	enabled="$(normalize_bool "$(uci_get main enabled 0)")"
+	docker_available=0
+	fw4_available=0
+	exists=0
+	running=0
+	command -v docker >/dev/null 2>&1 && docker_available=1
+	command -v fw4 >/dev/null 2>&1 && fw4_available=1
+	container_exists && exists=1
+	container_running && running=1
+	image="$(container_image)"
+	version="$(package_version)"
+
+	listen_port="$(uci_get main listen_port 8080)"
+	web_port="$(uci_get main web_port 8081)"
+	web_password="$(uci_get main web_password '')"
+	web_password_set=0
+	[ -n "$web_password" ] && web_password_set=1
+	is_port "$listen_port" || listen_port=0
+	is_port "$web_port" || web_port=0
+
+	rules_enabled="$(normalize_bool "$(uci_get main rules_enabled 0)")"
+	rules_exists=0
+	[ -f "$RULE_FILE" ] && rules_exists=1
+	target_count="$(enabled_target_count)"
+	target_count_v4="$(enabled_target_count_by_family ipv4)"
+	target_count_v6="$(enabled_target_count_by_family ipv6)"
+	quic_target_count="$(effective_quic_target_count)"
+	quic_target_count_v4="$(effective_quic_target_count_by_family ipv4)"
+	quic_target_count_v6="$(effective_quic_target_count_by_family ipv6)"
+	block_quic_default="$(global_block_quic)"
+	interface_count="$(count_words "$(configured_interfaces)")"
+	ignore_host_count="$(count_words "$(configured_ignore_hosts)")"
+	exclude_cidr6_count="$(count_words "$(configured_excludes6)")"
+	ipv6_status="$(ipv6_enabled)"
+	last_error="$(uci_get main last_error '')"
+
+	cert_generated=0
+	certs_generated && cert_generated=1
+
+	printf '{'
+	printf '"ok":true,'
+	printf '"package":{"name":"%s","version":"%s"},' \
+		"$(json_escape "$PACKAGE_NAME")" \
+		"$(json_escape "$version")"
+	printf '"enabled":%s,' "$(json_bool "$enabled")"
+	printf '"docker_available":%s,' "$(json_bool "$docker_available")"
+	printf '"fw4_available":%s,' "$(json_bool "$fw4_available")"
+	printf '"container":{"name":"%s","exists":%s,"running":%s,"image":"%s"},' \
+		"$(json_escape "$(uci_get main container_name mitmproxy)")" \
+		"$(json_bool "$exists")" \
+		"$(json_bool "$running")" \
+		"$(json_escape "$image")"
+	printf '"ports":{"proxy":%s,"web":%s},' "$listen_port" "$web_port"
+	printf '"web":{"password":"%s","password_set":%s},' \
+		"$(json_escape "$web_password")" \
+		"$(json_bool "$web_password_set")"
+	printf '"rules":{"enabled":%s,"file":"%s","exists":%s,"target_count":%s,"target_count_v4":%s,"target_count_v6":%s,"quic_target_count":%s,"quic_target_count_v4":%s,"quic_target_count_v6":%s,"block_quic_default":%s,"ipv6_enabled":%s,"interface_count":%s,"ignore_host_count":%s,"exclude_cidr6_count":%s},' \
+		"$(json_bool "$rules_enabled")" \
+		"$(json_escape "$RULE_FILE")" \
+		"$(json_bool "$rules_exists")" \
+		"$target_count" \
+		"$target_count_v4" \
+		"$target_count_v6" \
+		"$quic_target_count" \
+		"$quic_target_count_v4" \
+		"$quic_target_count_v6" \
+		"$(json_bool "$block_quic_default")" \
+		"$(json_bool "$ipv6_status")" \
+		"$interface_count" \
+		"$ignore_host_count" \
+		"$exclude_cidr6_count"
+	printf '"certificates":{"generated":%s,"public_files":[' "$(json_bool "$cert_generated")"
+	public_files_json
+	printf ']},'
+	if [ "$APPLY_RESULT" = "1" ]; then
+		printf '"apply":{"container_started":%s,"container_rebuilt":%s},' \
+			"$(json_bool "$APPLY_CONTAINER_STARTED")" \
+			"$(json_bool "$APPLY_CONTAINER_REBUILT")"
+	fi
+	printf '"last_error":"%s"' "$(json_escape "$last_error")"
+	printf '}\n'
+}
+
+lease_info_by_ip() {
+	local wanted="$1" expires mac ip hostname rest
+
+	[ -f /tmp/dhcp.leases ] || return 1
+
+	while read -r expires mac ip hostname rest; do
+		[ "$ip" = "$wanted" ] || continue
+		is_ipv4 "$ip" || continue
+		[ -n "$hostname" ] && [ "$hostname" != "*" ] || hostname=unknown
+		printf '%s %s %s' "${expires:-0}" "$mac" "$hostname"
+		return 0
+	done < /tmp/dhcp.leases
+
+	return 1
+}
+
+list_targets_json() {
+	local section first=1 enabled type name ip cidr mac comment quic_policy effective_block_quic value family ip_version
+	local lease lease_present lease_expires lease_expires_in lease_mac lease_hostname now
+
+	printf '{"ok":true,"targets":['
+	now="$(date +%s 2>/dev/null || printf 0)"
+	for section in $(target_sections); do
+		enabled="$(normalize_bool "$(uci_get "$section" enabled 0)")"
+		type="$(uci_get "$section" type ip)"
+		name="$(uci_get "$section" name '')"
+		ip="$(uci_get "$section" ip '')"
+		cidr="$(uci_get "$section" cidr '')"
+		value="$ip"
+		[ "$type" = "cidr" ] && value="$cidr"
+		family="$(value_family "$value")" || family=unknown
+		ip_version="$(family_version "$family")"
+		mac="$(uci_get "$section" mac '')"
+		comment="$(uci_get "$section" comment '')"
+		quic_policy="$(target_quic_policy "$section")" || quic_policy=inherit
+		effective_block_quic="$(target_effective_block_quic "$section")" || effective_block_quic="$(global_block_quic)"
+		lease_present=0
+		lease_expires=0
+		lease_expires_in=0
+		lease_mac=
+		lease_hostname=
+
+		if [ "$type" = "ip" ] && [ "$family" = "ipv4" ] && [ -n "$ip" ]; then
+			lease="$(lease_info_by_ip "$ip")" || lease=
+			if [ -n "$lease" ]; then
+				set -- $lease
+				lease_present=1
+				lease_expires="${1:-0}"
+				lease_mac="${2:-}"
+				lease_hostname="${3:-unknown}"
+				if [ "$lease_expires" -gt "$now" ] 2>/dev/null; then
+					lease_expires_in=$((lease_expires - now))
+				fi
+			fi
+		fi
+
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"id":"%s","name":"%s","enabled":%s,"type":"%s","family":"%s","ip_version":%s,"ip":"%s","cidr":"%s","mac":"%s","comment":"%s","quic_policy":"%s","effective_block_quic":%s,"lease":{"present":%s,"hostname":"%s","mac":"%s","expires":%s,"expires_in":%s}}' \
+			"$(json_escape "$section")" \
+			"$(json_escape "$name")" \
+			"$(json_bool "$enabled")" \
+			"$(json_escape "$type")" \
+			"$(json_escape "$family")" \
+			"$ip_version" \
+			"$(json_escape "$ip")" \
+			"$(json_escape "$cidr")" \
+			"$(json_escape "$mac")" \
+			"$(json_escape "$comment")" \
+			"$(json_escape "$quic_policy")" \
+			"$(json_bool "$effective_block_quic")" \
+			"$(json_bool "$lease_present")" \
+			"$(json_escape "$lease_hostname")" \
+			"$(json_escape "$lease_mac")" \
+			"$lease_expires" \
+			"$lease_expires_in"
+	done
+	printf ']}\n'
+}
+
+list_leases_json() {
+	local first=1 expires mac ip hostname rest now expires_in target target_enabled target_name target_quic_policy target_effective_block_quic
+
+	printf '{"ok":true,"leases":['
+	now="$(date +%s 2>/dev/null || printf 0)"
+	if [ -f /tmp/dhcp.leases ]; then
+		while read -r expires mac ip hostname rest; do
+			[ -n "$ip" ] || continue
+			is_ipv4 "$ip" || continue
+			[ -n "$hostname" ] && [ "$hostname" != "*" ] || hostname=unknown
+			expires_in=0
+			if [ "${expires:-0}" -gt "$now" ] 2>/dev/null; then
+				expires_in=$((expires - now))
+			fi
+			target="$(find_target_by_value ip "$ip")" || target=
+			target_enabled=0
+			target_name=
+			target_quic_policy=
+			target_effective_block_quic=0
+			if [ -n "$target" ]; then
+				target_enabled="$(normalize_bool "$(uci_get "$target" enabled 0)")"
+				target_name="$(uci_get "$target" name '')"
+				target_quic_policy="$(target_quic_policy "$target")" || target_quic_policy=inherit
+				target_effective_block_quic="$(target_effective_block_quic "$target")" || target_effective_block_quic="$(global_block_quic)"
+			fi
+
+			[ "$first" -eq 1 ] || printf ','
+			first=0
+			printf '{"hostname":"%s","ip":"%s","mac":"%s","expires":%s,"expires_in":%s,"target_id":"%s","target_enabled":%s,"target_name":"%s","target_quic_policy":"%s","target_effective_block_quic":%s}' \
+				"$(json_escape "$hostname")" \
+				"$(json_escape "$ip")" \
+				"$(json_escape "$mac")" \
+				"${expires:-0}" \
+				"$expires_in" \
+				"$(json_escape "$target")" \
+				"$(json_bool "$target_enabled")" \
+				"$(json_escape "$target_name")" \
+				"$(json_escape "$target_quic_policy")" \
+				"$(json_bool "$target_effective_block_quic")"
+		done < /tmp/dhcp.leases
+	fi
+	printf ']}\n'
+}
+
+discover_interfaces() {
+	local iface
+
+	if command -v ip >/dev/null 2>&1; then
+		ip -o link show 2>/dev/null | sed -n 's/^[0-9][0-9]*: \([^:@]*\).*/\1/p' | while read -r iface; do
+			case "$iface" in
+				lo|'') continue ;;
+			esac
+			is_interface_name "$iface" || continue
+			printf '%s\n' "$iface"
+		done
+	fi
+
+	printf '%s\n' br-lan
+	for iface in $(configured_interfaces); do
+		printf '%s\n' "$iface"
+	done
+}
+
+contains_word() {
+	local wanted="$1" item
+
+	for item in $2; do
+		[ "$item" = "$wanted" ] && return 0
+	done
+
+	return 1
+}
+
+iface_present() {
+	command -v ip >/dev/null 2>&1 || return 1
+	ip link show dev "$1" >/dev/null 2>&1
+}
+
+list_interfaces_json() {
+	local selected names iface first=1 selected_bool present_bool
+
+	selected="$(configured_interfaces)"
+	names="$(discover_interfaces | sort -u)"
+
+	printf '{"ok":true,"interfaces":['
+	for iface in $names; do
+		is_interface_name "$iface" || continue
+		selected_bool=0
+		present_bool=0
+		contains_word "$iface" "$selected" && selected_bool=1
+		iface_present "$iface" && present_bool=1
+
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"name":"%s","selected":%s,"present":%s}' \
+			"$(json_escape "$iface")" \
+			"$(json_bool "$selected_bool")" \
+			"$(json_bool "$present_bool")"
+	done
+	printf ']}\n'
+}
+
+find_target_by_value() {
+	local wanted_type="$1" wanted_value="$2" section type value
+
+	for section in $(target_sections); do
+		type="$(uci_get "$section" type ip)"
+		case "$type" in
+			ip) value="$(uci_get "$section" ip '')" ;;
+			cidr) value="$(uci_get "$section" cidr '')" ;;
+			*) value= ;;
+		esac
+
+		if [ "$type" = "$wanted_type" ] && [ "$value" = "$wanted_value" ]; then
+			printf '%s' "$section"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+cmd_add_target() {
+	local type="$1" value="$2" name="$3" comment="$4" enabled="$5" mac="$6" quic_policy="$7" section
+
+	command -v uci >/dev/null 2>&1 || { error_json "uci command not found"; exit 3; }
+	[ -n "$type" ] && [ -n "$value" ] || { error_json "Usage: add-target <ip|cidr> <value> [name] [comment] [enabled] [mac] [quic_policy]"; exit 2; }
+
+	case "$type" in
+		ip) is_ipv4 "$value" || is_ipv6 "$value" || { error_json "Invalid IP target"; exit 2; } ;;
+		cidr) is_cidr "$value" || is_cidr6 "$value" || { error_json "Invalid CIDR target"; exit 2; } ;;
+		*) error_json "Invalid target type"; exit 2 ;;
+	esac
+
+	enabled="$(normalize_bool "${enabled:-1}")"
+	name="$(one_line "${name:-$value}")"
+	comment="$(one_line "$comment")"
+	mac="$(one_line "$mac")"
+	quic_policy="$(normalize_quic_policy "$quic_policy")" || { error_json "Invalid QUIC policy"; exit 2; }
+
+	section="$(find_target_by_value "$type" "$value")"
+	if [ -z "$section" ]; then
+		section="$(uci -q add "$CONFIG" target 2>/dev/null)" || { error_json "Failed to add target"; exit 1; }
+	fi
+
+	uci -q set "$CONFIG.$section.type=$type" || { error_json "Failed to save target type"; exit 1; }
+	uci -q set "$CONFIG.$section.enabled=$enabled"
+	uci -q set "$CONFIG.$section.name=$name"
+	uci -q set "$CONFIG.$section.comment=$comment"
+	if [ "$type" = "ip" ]; then
+		uci -q set "$CONFIG.$section.ip=$value"
+		uci -q delete "$CONFIG.$section.cidr" 2>/dev/null
+	else
+		uci -q set "$CONFIG.$section.cidr=$value"
+		uci -q delete "$CONFIG.$section.ip" 2>/dev/null
+	fi
+	if [ -n "$mac" ]; then
+		uci -q set "$CONFIG.$section.mac=$mac"
+	fi
+	uci -q set "$CONFIG.$section.quic_policy=$quic_policy"
+	uci_commit
+	list_targets_json
+}
+
+cmd_set_target() {
+	local section="$1" field="$2" value="$3"
+
+	command -v uci >/dev/null 2>&1 || { error_json "uci command not found"; exit 3; }
+	[ -n "$section" ] && [ -n "$field" ] || { error_json "Usage: set-target <id> <field> <value>"; exit 2; }
+	section_exists "$section" || { error_json "Unknown target section"; exit 2; }
+
+	case "$field" in
+		enabled)
+			value="$(normalize_bool "$value")"
+			uci -q set "$CONFIG.$section.enabled=$value"
+			;;
+		name|comment)
+			value="$(one_line "$value")"
+			uci -q set "$CONFIG.$section.$field=$value"
+			;;
+		ip)
+			is_ipv4 "$value" || is_ipv6 "$value" || { error_json "Invalid IP target"; exit 2; }
+			uci -q set "$CONFIG.$section.type=ip"
+			uci -q set "$CONFIG.$section.ip=$value"
+			uci -q delete "$CONFIG.$section.cidr" 2>/dev/null
+			;;
+		cidr)
+			is_cidr "$value" || is_cidr6 "$value" || { error_json "Invalid CIDR target"; exit 2; }
+			uci -q set "$CONFIG.$section.type=cidr"
+			uci -q set "$CONFIG.$section.cidr=$value"
+			uci -q delete "$CONFIG.$section.ip" 2>/dev/null
+			;;
+		quic_policy)
+			value="$(normalize_quic_policy "$value")" || { error_json "Invalid QUIC policy"; exit 2; }
+			uci -q set "$CONFIG.$section.quic_policy=$value"
+			;;
+		*)
+			error_json "Unsupported target field"
+			exit 2
+			;;
+	esac
+
+	uci_commit
+	list_targets_json
+}
+
+cmd_delete_target() {
+	local section="$1"
+
+	command -v uci >/dev/null 2>&1 || { error_json "uci command not found"; exit 3; }
+	[ -n "$section" ] || { error_json "Usage: delete-target <id>"; exit 2; }
+	section_exists "$section" || { error_json "Unknown target section"; exit 2; }
+
+	uci -q delete "$CONFIG.$section" || { error_json "Failed to delete target"; exit 1; }
+	uci_commit
+	list_targets_json
+}
+
+emit_set_elements() {
+	local values="$1" first=1 item
+
+	for item in $values; do
+		[ "$first" -eq 1 ] || printf ',\n'
+		first=0
+		printf '        %s' "$item"
+	done
+	printf '\n'
+}
+
+emit_quoted_set() {
+	local values="$1" first=1 item
+
+	printf '{ '
+	for item in $values; do
+		[ "$first" -eq 1 ] || printf ', '
+		first=0
+		printf '"%s"' "$item"
+	done
+	printf ' }'
+}
+
+json_words_array() {
+	local values="$1" first=1 item
+
+	for item in $values; do
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '"%s"' "$(json_escape "$item")"
+	done
+}
+
+json_rule_file_lines() {
+	local first=1 line
+
+	[ -f "$RULE_FILE" ] || return 0
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '"%s"' "$(json_escape "$line")"
+	done < "$RULE_FILE"
+}
+
+nft_chain_exists() {
+	command -v nft >/dev/null 2>&1 || return 1
+	nft list chain inet fw4 "$1" >/dev/null 2>&1
+}
+
+nft_set_exists() {
+	command -v nft >/dev/null 2>&1 || return 1
+	nft list set inet fw4 "$1" >/dev/null 2>&1
+}
+
+nft_match_count() {
+	local count
+
+	if ! command -v nft >/dev/null 2>&1; then
+		printf 0
+		return 0
+	fi
+
+	count="$(nft list ruleset 2>/dev/null | grep -c 'mitmproxy_')" || count=0
+	printf '%s' "$count"
+}
+
+nft_match_count_family() {
+	local pattern="$1" count
+
+	if ! command -v nft >/dev/null 2>&1; then
+		printf 0
+		return 0
+	fi
+
+	count="$(nft list ruleset 2>/dev/null | grep 'mitmproxy_' | grep -E -c "$pattern")" || count=0
+	printf '%s' "$count"
+}
+
+nft_summary_json() {
+	local nft_available=0 prerouting=0 quic_block=0 clients=0 excludes=0 file_exists=0
+	local clients_v4=0 clients_v6=0 quic_clients=0 quic_clients_v4=0 quic_clients_v6=0 excludes_v4=0 excludes_v6=0
+	local config_valid=1 config_error= tcp_ports_json=
+
+	command -v nft >/dev/null 2>&1 && nft_available=1
+	[ -f "$RULE_FILE" ] && file_exists=1
+	nft_chain_exists mitmproxy_prerouting && prerouting=1
+	nft_chain_exists mitmproxy_quic_block && quic_block=1
+	nft_set_exists mitm_clients_v4 && clients_v4=1
+	nft_set_exists mitm_clients_v6 && clients_v6=1
+	nft_set_exists mitm_quic_clients_v4 && quic_clients_v4=1
+	nft_set_exists mitm_quic_clients_v6 && quic_clients_v6=1
+	nft_set_exists mitm_exclude_v4 && excludes_v4=1
+	nft_set_exists mitm_exclude_v6 && excludes_v6=1
+	if [ "$clients_v4" = "1" ] || [ "$clients_v6" = "1" ]; then
+		clients=1
+	fi
+	if [ "$quic_clients_v4" = "1" ] || [ "$quic_clients_v6" = "1" ]; then
+		quic_clients=1
+	fi
+	if [ "$excludes_v4" = "1" ] || [ "$excludes_v6" = "1" ]; then
+		excludes=1
+	fi
+
+	if validate_main_config && collect_rule_config; then
+		build_tcp_ports
+		BLOCK_QUIC="$(global_block_quic)"
+	else
+		config_valid=0
+		config_error="$ERR"
+	fi
+
+	case "$TCP_PORTS" in
+		*80*443*) tcp_ports_json='"80","443"' ;;
+		*80*) tcp_ports_json='"80"' ;;
+		*443*) tcp_ports_json='"443"' ;;
+		*) tcp_ports_json= ;;
+	esac
+
+	printf '{'
+	printf '"ok":true,'
+	printf '"config":{"valid":%s,"error":"%s","targets":[' \
+		"$(json_bool "$config_valid")" \
+		"$(json_escape "$config_error")"
+	json_words_array "$RULE_TARGETS"
+	printf '],"targets_v4":['
+	json_words_array "$RULE_TARGETS_V4"
+	printf '],"targets_v6":['
+	json_words_array "$RULE_TARGETS_V6"
+	printf '],"interfaces":['
+	json_words_array "$RULE_INTERFACES"
+	printf '],"exclude_cidr":['
+	json_words_array "$RULE_EXCLUDES_V4"
+	printf '],"exclude_cidr6":['
+	json_words_array "$RULE_EXCLUDES_V6"
+	printf '],"tcp_ports":['
+	printf '%s' "$tcp_ports_json"
+	printf '],"quic_targets":['
+	json_words_array "$RULE_QUIC_TARGETS"
+	printf '],"quic_targets_v4":['
+	json_words_array "$RULE_QUIC_TARGETS_V4"
+	printf '],"quic_targets_v6":['
+	json_words_array "$RULE_QUIC_TARGETS_V6"
+	printf '],"block_quic":%s,"block_quic_default":%s,"ipv6_enabled":%s,"warnings":[' \
+		"$(json_bool "$BLOCK_QUIC")" \
+		"$(json_bool "$BLOCK_QUIC")" \
+		"$(json_bool "$IPV6_ENABLED")"
+	json_words_array "$RULE_WARNINGS"
+	printf '],"ignore_hosts":['
+	json_words_array "$(configured_ignore_hosts)"
+	printf ']},'
+	printf '"file":{"path":"%s","exists":%s,"lines":[' \
+		"$(json_escape "$RULE_FILE")" \
+		"$(json_bool "$file_exists")"
+	json_rule_file_lines
+	printf ']},'
+	printf '"runtime":{"nft_available":%s,"prerouting_chain":%s,"quic_chain":%s,"client_set":%s,"client_set_v4":%s,"client_set_v6":%s,"quic_client_set":%s,"quic_client_set_v4":%s,"quic_client_set_v6":%s,"exclude_set":%s,"exclude_set_v4":%s,"exclude_set_v6":%s,"match_count":%s,"match_count_v4":%s,"match_count_v6":%s}' \
+		"$(json_bool "$nft_available")" \
+		"$(json_bool "$prerouting")" \
+		"$(json_bool "$quic_block")" \
+		"$(json_bool "$clients")" \
+		"$(json_bool "$clients_v4")" \
+		"$(json_bool "$clients_v6")" \
+		"$(json_bool "$quic_clients")" \
+		"$(json_bool "$quic_clients_v4")" \
+		"$(json_bool "$quic_clients_v6")" \
+		"$(json_bool "$excludes")" \
+		"$(json_bool "$excludes_v4")" \
+		"$(json_bool "$excludes_v6")" \
+		"$(nft_match_count)" \
+		"$(nft_match_count_family '_v4|ip saddr')" \
+		"$(nft_match_count_family '_v6|ip6 saddr')"
+	printf '}\n'
+}
+
+RULE_TARGETS=
+RULE_TARGETS_V4=
+RULE_TARGETS_V6=
+RULE_QUIC_TARGETS=
+RULE_QUIC_TARGETS_V4=
+RULE_QUIC_TARGETS_V6=
+RULE_INTERFACES=
+RULE_EXCLUDES_V4=
+RULE_EXCLUDES_V6=
+RULE_WARNINGS=
+TCP_PORTS=
+BLOCK_QUIC=0
+IPV6_ENABLED=0
+
+collect_rule_config() {
+	local section enabled type value family iface cidr quic_policy effective_block_quic
+
+	RULE_TARGETS=
+	RULE_TARGETS_V4=
+	RULE_TARGETS_V6=
+	RULE_QUIC_TARGETS=
+	RULE_QUIC_TARGETS_V4=
+	RULE_QUIC_TARGETS_V6=
+	RULE_INTERFACES="$(configured_interfaces)"
+	RULE_EXCLUDES_V4="$(configured_excludes)"
+	RULE_EXCLUDES_V6="$(configured_excludes6)"
+	RULE_WARNINGS=
+	BLOCK_QUIC="$(global_block_quic)"
+	IPV6_ENABLED="$(ipv6_enabled)"
+
+	for iface in $RULE_INTERFACES; do
+		is_interface_name "$iface" || { set_last_error "Invalid interface: $iface"; return 1; }
+	done
+
+	for cidr in $RULE_EXCLUDES_V4; do
+		is_cidr "$cidr" || is_ipv4 "$cidr" || { set_last_error "Invalid exclude_cidr: $cidr"; return 1; }
+	done
+
+	for cidr in $RULE_EXCLUDES_V6; do
+		is_cidr6 "$cidr" || is_ipv6 "$cidr" || { set_last_error "Invalid exclude_cidr6: $cidr"; return 1; }
+	done
+
+	for section in $(target_sections); do
+		enabled="$(normalize_bool "$(uci_get "$section" enabled 0)")"
+		[ "$enabled" = "1" ] || continue
+
+		type="$(uci_get "$section" type ip)"
+		case "$type" in
+			ip)
+				value="$(uci_get "$section" ip '')"
+				is_ipv4 "$value" || is_ipv6 "$value" || { set_last_error "Invalid IP target in $section"; return 1; }
+				;;
+			cidr)
+				value="$(uci_get "$section" cidr '')"
+				is_cidr "$value" || is_cidr6 "$value" || { set_last_error "Invalid CIDR target in $section"; return 1; }
+				;;
+			*)
+				set_last_error "Invalid target type in $section"
+				return 1
+				;;
+		esac
+
+		family="$(value_family "$value")" || { set_last_error "Invalid target family in $section"; return 1; }
+
+		quic_policy="$(uci_get "$section" quic_policy inherit)"
+		quic_policy="$(normalize_quic_policy "$quic_policy")" || { set_last_error "Invalid quic_policy in $section"; return 1; }
+		case "$quic_policy" in
+			block) effective_block_quic=1 ;;
+			allow) effective_block_quic=0 ;;
+			*) effective_block_quic="$BLOCK_QUIC" ;;
+		esac
+
+		case "$family" in
+			ipv4)
+				RULE_TARGETS_V4="$RULE_TARGETS_V4 $value"
+				RULE_TARGETS="$RULE_TARGETS $value"
+				if [ "$effective_block_quic" = "1" ]; then
+					RULE_QUIC_TARGETS_V4="$RULE_QUIC_TARGETS_V4 $value"
+					RULE_QUIC_TARGETS="$RULE_QUIC_TARGETS $value"
+				fi
+				;;
+			ipv6)
+				if [ "$IPV6_ENABLED" = "1" ]; then
+					RULE_TARGETS_V6="$RULE_TARGETS_V6 $value"
+					RULE_TARGETS="$RULE_TARGETS $value"
+					if [ "$effective_block_quic" = "1" ]; then
+						RULE_QUIC_TARGETS_V6="$RULE_QUIC_TARGETS_V6 $value"
+						RULE_QUIC_TARGETS="$RULE_QUIC_TARGETS $value"
+					fi
+				else
+					RULE_WARNINGS="$RULE_WARNINGS ipv6_target_ignored"
+				fi
+				;;
+		esac
+	done
+
+	return 0
+}
+
+build_tcp_ports() {
+	local ports=
+
+	if [ "$(normalize_bool "$(uci_get main intercept_http 1)")" = "1" ]; then
+		ports=80
+	fi
+
+	if [ "$(normalize_bool "$(uci_get main intercept_https 1)")" = "1" ]; then
+		if [ -n "$ports" ]; then
+			ports="$ports, 443"
+		else
+			ports=443
+		fi
+	fi
+
+	if [ -n "$ports" ]; then
+		TCP_PORTS="{ $ports }"
+	else
+		TCP_PORTS=
+	fi
+}
+
+write_rules_file() {
+	local tmp="$1" listen_port ifaces_expr
+
+	listen_port="$(uci_get main listen_port 8080)"
+	ifaces_expr="$(emit_quoted_set "$RULE_INTERFACES")"
+
+	{
+		printf '# Generated by mitmproxyctl. Do not edit.\n\n'
+
+		if [ -n "$TCP_PORTS" ]; then
+			printf 'define mitm_tcp_ports = %s\n\n' "$TCP_PORTS"
+		fi
+
+		if [ -n "$RULE_TARGETS_V4" ]; then
+			printf 'set mitm_clients_v4 {\n'
+			printf '    type ipv4_addr\n'
+			printf '    flags interval\n'
+			printf '    elements = {\n'
+			emit_set_elements "$RULE_TARGETS_V4"
+			printf '    }\n'
+			printf '}\n\n'
+		fi
+
+		if [ -n "$RULE_TARGETS_V6" ]; then
+			printf 'set mitm_clients_v6 {\n'
+			printf '    type ipv6_addr\n'
+			printf '    flags interval\n'
+			printf '    elements = {\n'
+			emit_set_elements "$RULE_TARGETS_V6"
+			printf '    }\n'
+			printf '}\n\n'
+		fi
+
+		if [ -n "$RULE_QUIC_TARGETS_V4" ]; then
+			printf 'set mitm_quic_clients_v4 {\n'
+			printf '    type ipv4_addr\n'
+			printf '    flags interval\n'
+			printf '    elements = {\n'
+			emit_set_elements "$RULE_QUIC_TARGETS_V4"
+			printf '    }\n'
+			printf '}\n\n'
+		fi
+
+		if [ -n "$RULE_QUIC_TARGETS_V6" ]; then
+			printf 'set mitm_quic_clients_v6 {\n'
+			printf '    type ipv6_addr\n'
+			printf '    flags interval\n'
+			printf '    elements = {\n'
+			emit_set_elements "$RULE_QUIC_TARGETS_V6"
+			printf '    }\n'
+			printf '}\n\n'
+		fi
+
+		if [ -n "$RULE_EXCLUDES_V4" ]; then
+			printf 'set mitm_exclude_v4 {\n'
+			printf '    type ipv4_addr\n'
+			printf '    flags interval\n'
+			printf '    elements = {\n'
+			emit_set_elements "$RULE_EXCLUDES_V4"
+			printf '    }\n'
+			printf '}\n\n'
+		fi
+
+		if [ -n "$RULE_EXCLUDES_V6" ] && [ -n "$RULE_TARGETS_V6" ]; then
+			printf 'set mitm_exclude_v6 {\n'
+			printf '    type ipv6_addr\n'
+			printf '    flags interval\n'
+			printf '    elements = {\n'
+			emit_set_elements "$RULE_EXCLUDES_V6"
+			printf '    }\n'
+			printf '}\n\n'
+		fi
+
+		if [ -n "$TCP_PORTS" ] && { [ -n "$RULE_TARGETS_V4" ] || [ -n "$RULE_TARGETS_V6" ]; }; then
+			printf 'chain mitmproxy_prerouting {\n'
+			printf '    type nat hook prerouting priority dstnat - 5; policy accept;\n\n'
+
+			if [ -n "$RULE_TARGETS_V4" ]; then
+				printf '    iifname %s ip saddr @mitm_clients_v4 ' "$ifaces_expr"
+				if [ -n "$RULE_EXCLUDES_V4" ]; then
+					printf 'ip daddr != @mitm_exclude_v4 '
+				fi
+				printf 'tcp dport $mitm_tcp_ports redirect to :%s\n' "$listen_port"
+			fi
+
+			if [ -n "$RULE_TARGETS_V6" ]; then
+				printf '    iifname %s ip6 saddr @mitm_clients_v6 ' "$ifaces_expr"
+				if [ -n "$RULE_EXCLUDES_V6" ]; then
+					printf 'ip6 daddr != @mitm_exclude_v6 '
+				fi
+				printf 'tcp dport $mitm_tcp_ports redirect to :%s\n' "$listen_port"
+			fi
+			printf '}\n\n'
+		fi
+
+		if [ -n "$RULE_QUIC_TARGETS_V4" ] || [ -n "$RULE_QUIC_TARGETS_V6" ]; then
+			printf 'chain mitmproxy_quic_block {\n'
+			printf '    type filter hook forward priority filter - 5; policy accept;\n\n'
+			if [ -n "$RULE_QUIC_TARGETS_V4" ]; then
+				printf '    iifname %s ip saddr @mitm_quic_clients_v4 udp dport 443 reject\n' "$ifaces_expr"
+			fi
+			if [ -n "$RULE_QUIC_TARGETS_V6" ]; then
+				printf '    iifname %s ip6 saddr @mitm_quic_clients_v6 udp dport 443 reject\n' "$ifaces_expr"
+			fi
+			printf '}\n'
+		fi
+	} > "$tmp"
+}
+
+clear_rules_internal() {
+	local output rc
+
+	rm -f "$RULE_FILE" "$TMP_FILE" "$BAK_FILE"
+
+	if ! command -v fw4 >/dev/null 2>&1; then
+		uci_set_main rules_enabled 0
+		uci_commit
+		set_last_error "fw4 command not found"
+		return 3
+	fi
+
+	output="$(fw4 reload 2>&1)"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		uci_set_main rules_enabled 0
+		uci_commit
+		set_last_error "fw4 reload failed: $output"
+		return 1
+	fi
+
+	if command -v nft >/dev/null 2>&1; then
+		nft delete chain inet fw4 mitmproxy_prerouting 2>/dev/null || true
+		nft delete chain inet fw4 mitmproxy_quic_block 2>/dev/null || true
+		nft delete set inet fw4 mitm_clients_v4 2>/dev/null || true
+		nft delete set inet fw4 mitm_clients_v6 2>/dev/null || true
+		nft delete set inet fw4 mitm_quic_clients_v4 2>/dev/null || true
+		nft delete set inet fw4 mitm_quic_clients_v6 2>/dev/null || true
+		nft delete set inet fw4 mitm_exclude_v4 2>/dev/null || true
+		nft delete set inet fw4 mitm_exclude_v6 2>/dev/null || true
+	fi
+
+	uci_set_main rules_enabled 0
+	uci_set_main last_error ''
+	uci_commit
+	clear_last_error
+	return 0
+}
+
+apply_rules_internal() {
+	local enabled output rc restored_enabled
+
+	if ! command -v fw4 >/dev/null 2>&1; then
+		set_last_error "fw4 command not found"
+		return 3
+	fi
+
+	enabled="$(normalize_bool "$(uci_get main enabled 0)")"
+	if [ "$enabled" != "1" ]; then
+		clear_rules_internal
+		return $?
+	fi
+
+	validate_main_config || return 1
+	collect_rule_config || return 1
+	build_tcp_ports
+
+	if [ -z "$RULE_TARGETS" ] || [ -z "$RULE_INTERFACES" ] || { [ -z "$TCP_PORTS" ] && [ -z "$RULE_QUIC_TARGETS" ]; }; then
+		clear_rules_internal
+		return $?
+	fi
+
+	mkdir -p "$RULE_DIR" || { set_last_error "Failed to create rules directory"; return 1; }
+	rm -f "$TMP_FILE"
+
+	write_rules_file "$TMP_FILE" || { set_last_error "Failed to write temporary nft rules"; return 1; }
+
+	if [ -f "$RULE_FILE" ]; then
+		cp -p "$RULE_FILE" "$BAK_FILE" || { rm -f "$TMP_FILE"; set_last_error "Failed to backup existing nft rules"; return 1; }
+	else
+		rm -f "$BAK_FILE"
+	fi
+
+	mv "$TMP_FILE" "$RULE_FILE" || { rm -f "$TMP_FILE"; set_last_error "Failed to replace nft rules"; return 1; }
+
+	output="$(fw4 reload 2>&1)"
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		rm -f "$BAK_FILE"
+		uci_set_main rules_enabled 1
+		uci_set_main last_error ''
+		uci_commit
+		clear_last_error
+		sync_public_certs >/dev/null 2>&1
+		return 0
+	fi
+
+	if [ -f "$BAK_FILE" ]; then
+		mv "$BAK_FILE" "$RULE_FILE"
+	else
+		rm -f "$RULE_FILE"
+	fi
+	fw4 reload >/dev/null 2>&1
+
+	restored_enabled=0
+	[ -f "$RULE_FILE" ] && restored_enabled=1
+	uci_set_main rules_enabled "$restored_enabled"
+	uci_commit
+	set_last_error "fw4 reload failed, rolled back: $output"
+	return 1
+}
+
+sync_runtime_config_if_needed() {
+	local enabled
+
+	enabled="$(normalize_bool "$(uci_get main enabled 0)")"
+	[ "$enabled" = "1" ] || return 0
+	validate_main_config || return 1
+	command -v docker >/dev/null 2>&1 || return 0
+	ensure_confdir || return 1
+
+	if ! container_exists; then
+		start_container || return 1
+		APPLY_CONTAINER_STARTED=1
+		return 0
+	fi
+
+	if container_matches_runtime_config; then
+		if ! container_running; then
+			start_container || return 1
+			APPLY_CONTAINER_STARTED=1
+		fi
+		return 0
+	fi
+
+	stop_container || return 1
+	remove_container || return 1
+	start_container || return 1
+	APPLY_CONTAINER_REBUILT=1
+	return 0
+}
+
+port_in_use() {
+	local port="$1"
+
+	command -v ss >/dev/null 2>&1 || return 1
+	ss -lnt 2>/dev/null | awk '{ print $4 }' | grep -q "[.:]$port$"
+}
+
+start_container() {
+	local image name confdir listen_host listen_port web_host web_port web_password host output rc
+
+	image="$(uci_get main image mitmproxy/mitmproxy)"
+	name="$(uci_get main container_name mitmproxy)"
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	listen_host="$(runtime_listen_host)"
+	listen_port="$(uci_get main listen_port 8080)"
+	web_host="$(uci_get main web_host 0.0.0.0)"
+	web_port="$(uci_get main web_port 8081)"
+	ensure_web_password || return 1
+	web_password="$(uci_get main web_password '')"
+
+	if container_exists; then
+		if container_matches_runtime_config; then
+			if container_running; then
+				return 0
+			fi
+
+			output="$(docker start "$name" 2>&1)"
+			rc=$?
+			[ "$rc" -eq 0 ] && return 0
+			set_last_error "Failed to start container: $output"
+			return 1
+		fi
+
+		stop_container || return 1
+		remove_container || return 1
+	fi
+
+	if port_in_use "$listen_port" || port_in_use "$web_port"; then
+		set_last_error "Proxy or web port is already in use"
+		return 1
+	fi
+
+	set -- docker run -d \
+		--name "$name" \
+		--network host \
+		--restart unless-stopped \
+		--label luci.mitmproxy.managed=1 \
+		--label "luci.mitmproxy.listen_port=$listen_port" \
+		--label "luci.mitmproxy.web_port=$web_port" \
+		-e PYTHONUNBUFFERED=1 \
+		-v "$confdir:/home/mitmproxy/.mitmproxy" \
+		"$image" \
+		mitmweb \
+		--mode transparent \
+		--listen-host "$listen_host" \
+		--listen-port "$listen_port" \
+		--web-host "$web_host" \
+		--web-port "$web_port" \
+		--set block_global=false \
+		--set "web_password=$web_password"
+
+	for host in $(configured_ignore_hosts); do
+		set -- "$@" --set "ignore_hosts=$host"
+	done
+
+	set -- "$@" --showhost
+
+	output="$("$@" 2>&1)"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		set_last_error "Failed to create container: $output"
+		return 1
+	fi
+
+	return 0
+}
+
+stop_container() {
+	local name output rc
+
+	command -v docker >/dev/null 2>&1 || return 0
+	name="$(uci_get main container_name mitmproxy)"
+	container_exists || return 0
+	container_running || return 0
+
+	output="$(docker stop "$name" 2>&1)"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		set_last_error "Failed to stop container: $output"
+		return 1
+	fi
+
+	return 0
+}
+
+remove_container() {
+	local name output rc
+
+	command -v docker >/dev/null 2>&1 || return 0
+	name="$(uci_get main container_name mitmproxy)"
+	container_exists || return 0
+
+	output="$(docker rm "$name" 2>&1)"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		set_last_error "Failed to remove container: $output"
+		return 1
+	fi
+
+	return 0
+}
+
+is_cleanable_state_dir() {
+	local dir="$1"
+
+	is_safe_path "$dir" || return 1
+
+	case "$dir" in
+		/|/etc|/usr|/var|/tmp|/www|/home|/root|/mnt|/overlay|/rom|/proc|/sys|/dev|/run) return 1 ;;
+		*'/../'*|*'/..'|*'/./'*|*'/.'|*'//'*) return 1 ;;
+		*mitmproxy*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+clean_directory_contents() {
+	local dir="$1" path
+
+	[ -d "$dir" ] || return 0
+	if ! is_cleanable_state_dir "$dir"; then
+		set_last_error "Refusing to clean unsafe directory: $dir"
+		return 1
+	fi
+
+	for path in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+		[ -e "$path" ] || continue
+		rm -rf "$path" || { set_last_error "Failed to clean: $path"; return 1; }
+	done
+
+	return 0
+}
+
+clean_runtime_state() {
+	local confdir
+
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	clean_directory_contents "$confdir" || return 1
+	clean_directory_contents "$PUBLIC_CERT_DIR" || return 1
+	return 0
+}
+
+cmd_start() {
+	command -v docker >/dev/null 2>&1 || { set_last_error "docker command not found"; error_json "$ERR"; exit 3; }
+	command -v fw4 >/dev/null 2>&1 || { set_last_error "fw4 command not found"; error_json "$ERR"; exit 3; }
+	validate_main_config || { error_json "$ERR"; exit 1; }
+	ensure_confdir || { error_json "$ERR"; exit 1; }
+
+	uci_set_main enabled 1
+	uci_commit
+
+	start_container || { error_json "$ERR"; exit 1; }
+	apply_rules_internal || { error_json "$ERR"; exit 1; }
+	status_json
+}
+
+cmd_stop() {
+	local rc=0
+
+	uci_set_main enabled 0
+	uci_commit
+	clear_rules_internal || rc=$?
+	stop_container || rc=1
+	status_json
+	exit "$rc"
+}
+
+cmd_restart() {
+	command -v docker >/dev/null 2>&1 || { set_last_error "docker command not found"; error_json "$ERR"; exit 3; }
+	command -v fw4 >/dev/null 2>&1 || { set_last_error "fw4 command not found"; error_json "$ERR"; exit 3; }
+	validate_main_config || { error_json "$ERR"; exit 1; }
+	ensure_confdir || { error_json "$ERR"; exit 1; }
+
+	uci_set_main enabled 1
+	uci_commit
+
+	clear_rules_internal >/dev/null 2>&1
+	stop_container || { error_json "$ERR"; exit 1; }
+	remove_container || { error_json "$ERR"; exit 1; }
+	start_container || { error_json "$ERR"; exit 1; }
+	apply_rules_internal || { error_json "$ERR"; exit 1; }
+	status_json
+}
+
+cmd_clean() {
+	local rc=0 name confdir
+
+	name="$(uci_get main container_name mitmproxy)"
+	confdir="$(uci_get main confdir /etc/mitmproxy)"
+	is_safe_container_name "$name" || { set_last_error "Invalid container name"; error_json "$ERR"; exit 1; }
+	is_cleanable_state_dir "$confdir" || { set_last_error "Refusing to clean unsafe directory: $confdir"; error_json "$ERR"; exit 1; }
+
+	uci_set_main enabled 0
+	uci_commit
+
+	clear_rules_internal || rc=$?
+	stop_container || rc=1
+	remove_container || rc=1
+	clean_runtime_state || rc=1
+	status_json
+	exit "$rc"
+}
+
+cmd_apply_rules() {
+	APPLY_RESULT=1
+	APPLY_CONTAINER_STARTED=0
+	APPLY_CONTAINER_REBUILT=0
+	sync_runtime_config_if_needed || { error_json "$ERR"; exit 1; }
+	apply_rules_internal || { error_json "$ERR"; exit 1; }
+	status_json
+}
+
+cmd_clear_rules() {
+	clear_rules_internal || { error_json "$ERR"; exit 1; }
+	status_json
+}
+
+logs_json() {
+	local limit="$1" name logs line first=1
+
+	case "$limit" in
+		''|*[!0-9]*) limit=80 ;;
+	esac
+	[ "$limit" -ge 1 ] 2>/dev/null && [ "$limit" -le 500 ] 2>/dev/null || limit=80
+
+	name="$(uci_get main container_name mitmproxy)"
+	if ! command -v docker >/dev/null 2>&1 || ! container_exists; then
+		printf '{"ok":true,"logs":[]}\n'
+		return 0
+	fi
+
+	logs="$(docker logs --tail "$limit" "$name" 2>&1)"
+	printf '{"ok":true,"logs":['
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '"%s"' "$(json_escape "$line")"
+	done <<EOF
+$logs
+EOF
+	printf ']}\n'
+}
+
+certs_json() {
+	local generated=0
+
+	sync_public_certs >/dev/null 2>&1
+	certs_generated && generated=1
+
+	printf '{"ok":true,"generated":%s,"primary":' "$(json_bool "$generated")"
+	primary_cert_json || printf 'null'
+	printf ',"files":['
+	public_files_json
+	printf ']}\n'
+}
+
+public_cert_available() {
+	[ -f "$PUBLIC_CERT_DIR/mitmproxy-ca-cert.cer" ] || \
+	[ -f "$PUBLIC_CERT_DIR/mitmproxy-ca-cert.pem" ]
+}
+
+DIAG_HINT_FIRST=1
+
+diag_hint() {
+	[ "$DIAG_HINT_FIRST" = "1" ] || printf ','
+	DIAG_HINT_FIRST=0
+	printf '"%s"' "$(json_escape "$1")"
+}
+
+cmd_mobile_diagnostics() {
+	local ip="$1" target= target_name= target_enabled=0 target_quic_policy= target_effective_block_quic
+	local target_family= target_ip_version=0 ipv6_status target_in_rules=0
+	local cert_generated=0 public_cert=0 docker_available=0 fw4_available=0 running=0
+	local rules_enabled rules_exists=0 tcp443_enabled lease_present=0
+
+	if [ -n "$ip" ]; then
+		if is_ipv4 "$ip"; then
+			target_family=ipv4
+			target_ip_version=4
+		elif is_ipv6 "$ip"; then
+			target_family=ipv6
+			target_ip_version=6
+		else
+			error_json "Invalid IP address"
+			exit 2
+		fi
+	fi
+
+	sync_public_certs >/dev/null 2>&1
+	certs_generated && cert_generated=1
+	public_cert_available && public_cert=1
+	command -v docker >/dev/null 2>&1 && docker_available=1
+	command -v fw4 >/dev/null 2>&1 && fw4_available=1
+	container_running && running=1
+	rules_enabled="$(normalize_bool "$(uci_get main rules_enabled 0)")"
+	[ -f "$RULE_FILE" ] && rules_exists=1
+	tcp443_enabled="$(normalize_bool "$(uci_get main intercept_https 1)")"
+	target_effective_block_quic="$(global_block_quic)"
+	ipv6_status="$(ipv6_enabled)"
+
+	if [ -n "$ip" ]; then
+		target="$(find_target_by_value ip "$ip")" || target=
+		if [ "$target_family" = "ipv4" ]; then
+			lease_info_by_ip "$ip" >/dev/null 2>&1 && lease_present=1
+		fi
+	fi
+
+	if [ -n "$target" ]; then
+		target_name="$(uci_get "$target" name '')"
+		target_enabled="$(normalize_bool "$(uci_get "$target" enabled 0)")"
+		target_quic_policy="$(target_quic_policy "$target")" || target_quic_policy=inherit
+		target_effective_block_quic="$(target_effective_block_quic "$target")" || target_effective_block_quic="$(global_block_quic)"
+		if [ "$target_enabled" = "1" ]; then
+			case "$target_family" in
+				ipv4) target_in_rules=1 ;;
+				ipv6) [ "$ipv6_status" = "1" ] && target_in_rules=1 ;;
+			esac
+		fi
+	fi
+
+	printf '{'
+	printf '"ok":true,'
+	printf '"target_ip":"%s",' "$(json_escape "$ip")"
+	printf '"target_address":"%s",' "$(json_escape "$ip")"
+	printf '"target_family":"%s",' "$(json_escape "$target_family")"
+	printf '"target_ip_version":%s,' "$target_ip_version"
+	printf '"checks":{'
+	printf '"certificates_generated":%s,' "$(json_bool "$cert_generated")"
+	printf '"public_ca_available":%s,' "$(json_bool "$public_cert")"
+	printf '"docker_available":%s,' "$(json_bool "$docker_available")"
+	printf '"fw4_available":%s,' "$(json_bool "$fw4_available")"
+	printf '"container_running":%s,' "$(json_bool "$running")"
+	printf '"rules_enabled":%s,' "$(json_bool "$rules_enabled")"
+	printf '"rules_file_exists":%s,' "$(json_bool "$rules_exists")"
+	printf '"tcp443_enabled":%s,' "$(json_bool "$tcp443_enabled")"
+	printf '"target_found":%s,' "$(json_bool "$([ -n "$target" ] && printf 1 || printf 0)")"
+	printf '"target_enabled":%s,' "$(json_bool "$target_enabled")"
+	printf '"target_in_rules":%s,' "$(json_bool "$target_in_rules")"
+	printf '"ipv6_enabled":%s,' "$(json_bool "$ipv6_status")"
+	printf '"dhcp_lease_present":%s,' "$(json_bool "$lease_present")"
+	printf '"effective_block_quic":%s' "$(json_bool "$target_effective_block_quic")"
+	printf '},'
+	printf '"target":'
+	if [ -n "$target" ]; then
+		printf '{"id":"%s","name":"%s","enabled":%s,"family":"%s","ip_version":%s,"quic_policy":"%s","effective_block_quic":%s}' \
+			"$(json_escape "$target")" \
+			"$(json_escape "$target_name")" \
+			"$(json_bool "$target_enabled")" \
+			"$(json_escape "$target_family")" \
+			"$target_ip_version" \
+			"$(json_escape "$target_quic_policy")" \
+			"$(json_bool "$target_effective_block_quic")"
+	else
+		printf 'null'
+	fi
+	printf ',"hints":['
+	DIAG_HINT_FIRST=1
+	[ "$cert_generated" = "1" ] || diag_hint "CA has not been generated yet. Start mitmproxy once, then reopen the Certificates page."
+	[ "$public_cert" = "1" ] || diag_hint "Public CA certificate is not available under /www/mitmproxy-ca. Start or Sync runtime to sync public certificates."
+	[ "$docker_available" = "1" ] || diag_hint "Docker is not available, so mitmproxy cannot run on this router."
+	[ "$fw4_available" = "1" ] || diag_hint "firewall4/fw4 is not available, so transparent nft rules cannot be applied."
+	[ "$running" = "1" ] || diag_hint "The mitmproxy container is not running. Start the service before testing HTTPS traffic."
+	[ "$rules_enabled" = "1" ] && [ "$rules_exists" = "1" ] || diag_hint "Firewall rules are not applied. Use Sync runtime or Start before testing the mobile device."
+	[ "$tcp443_enabled" = "1" ] || diag_hint "TCP 443 interception is disabled. Enable HTTPS interception in Rules."
+	if [ -n "$ip" ]; then
+		case "$target_family" in
+			ipv6)
+				[ "$ipv6_status" = "1" ] || diag_hint "IPv6 interception is disabled. Enable IPv6 interception in Rules before testing this target."
+				[ -n "$target" ] || diag_hint "This IPv6 address is not configured as a target. Add it on the Targets page."
+				[ "$target_in_rules" = "1" ] || diag_hint "This IPv6 target is not active in the generated rules. Confirm IPv6 interception is enabled and the target is enabled."
+				diag_hint "IPv6 privacy addresses may rotate. Confirm the device still uses this exact IPv6 address before testing."
+				;;
+			*)
+				[ -n "$target" ] || diag_hint "This IPv4 address is not configured as a target. Add it on the Targets page."
+				[ "$lease_present" = "1" ] || diag_hint "No current DHCP lease was found for this IPv4 address. Confirm the phone is on this LAN and still has this IP."
+				;;
+		esac
+		[ -z "$target" ] || [ "$target_enabled" = "1" ] || diag_hint "This target exists but is disabled. Enable it before testing."
+	fi
+	[ "$target_effective_block_quic" = "1" ] || diag_hint "QUIC is allowed for this target. HTTP/3 traffic may bypass TCP 443 interception; set the target QUIC policy to block for HTTPS debugging."
+	diag_hint "If browser HTTPS works but a specific app still fails, check Android user CA trust restrictions or certificate pinning in that app."
+	printf ']}\n'
+}
+
+usage() {
+	cat <<'EOF'
+Usage: mitmproxyctl <command> [args]
+
+Commands:
+  status
+  start
+  stop
+  restart
+  clean
+  apply-rules
+  clear-rules
+  nft-summary
+  list-targets
+  list-leases
+  list-interfaces
+  add-target <ip|cidr> <value> [name] [comment] [enabled] [mac] [quic_policy]
+  set-target <id> <field> <value>
+  delete-target <id>
+  logs [lines]
+  certs
+  mobile-diagnostics [target-ip-address]
+EOF
+}
+
+case "$1" in
+	status) status_json ;;
+	start) cmd_start ;;
+	stop) cmd_stop ;;
+	restart) cmd_restart ;;
+	clean) cmd_clean ;;
+	apply-rules) cmd_apply_rules ;;
+	clear-rules) cmd_clear_rules ;;
+	nft-summary) nft_summary_json ;;
+	list-targets) list_targets_json ;;
+	list-leases) list_leases_json ;;
+	list-interfaces) list_interfaces_json ;;
+	add-target) shift; cmd_add_target "$@" ;;
+	set-target) shift; cmd_set_target "$@" ;;
+	delete-target) shift; cmd_delete_target "$@" ;;
+	logs) shift; logs_json "$1" ;;
+	certs) certs_json ;;
+	mobile-diagnostics) shift; cmd_mobile_diagnostics "$1" ;;
+	-h|--help|help) usage ;;
+	'') usage; exit 2 ;;
+	*) error_json "Unknown command: $1"; exit 2 ;;
+esac
