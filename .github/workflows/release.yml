@@ -97,7 +97,9 @@ jobs:
           cd "$sdk_dir"
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          echo "CONFIG_PACKAGE_${PACKAGE_NAME}=m" >> .config
           make defconfig
+          grep -q "^CONFIG_PACKAGE_${PACKAGE_NAME}=m$" .config
           make "package/$PACKAGE_NAME/compile" V=s
 
           out_dir="$GITHUB_WORKSPACE/dist/${{ matrix.label }}"
