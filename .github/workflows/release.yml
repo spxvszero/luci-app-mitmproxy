@@ -96,9 +96,16 @@ jobs:
             "$GITHUB_WORKSPACE/" "$package_dir/"
 
           cd "$sdk_dir"
-          printf '\nsrc-link local_mitmproxy %s\n' "$feed_dir" >> feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          printf '\nsrc-link local_mitmproxy %s\n' "$feed_dir" >> feeds.conf.default
+          ./scripts/feeds update local_mitmproxy
+          if ! grep -n "$PACKAGE_NAME" feeds/local_mitmproxy.index; then
+            echo "Local feed index did not contain $PACKAGE_NAME"
+            find "$feed_dir" -maxdepth 3 -type f -print
+            exit 1
+          fi
+          ./scripts/feeds install -p local_mitmproxy "$PACKAGE_NAME"
 
           test -f "package/feeds/local_mitmproxy/$PACKAGE_NAME/Makefile"
           rm -rf tmp
