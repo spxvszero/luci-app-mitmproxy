@@ -25,4 +25,4 @@
 
 - Keep generated files and local build outputs out of source control.
 - Avoid adding device-specific notes to public docs.
-- If native binaries are introduced later, switch away from `LUCI_PKGARCH:=all` and publish per-target packages.
+- If native binaries are introduced later, switch away from `PKGARCH:=all` and publish per-target packages.

@@ -41,6 +41,6 @@ The package is architecture independent:
 
 - LuCI JavaScript lives under `htdocs/`.
 - Router-side shell, init scripts, UCI defaults, ACL, and menu files live under `root/`.
-- The OpenWrt package Makefile sets `LUCI_PKGARCH:=all`.
+- The OpenWrt package Makefile sets `PKGARCH:=all`.
 
 GitHub release builds still use multiple OpenWrt SDK targets to prove the package builds cleanly for common x86 and ARM environments.
