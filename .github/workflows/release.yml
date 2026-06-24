@@ -55,6 +55,9 @@ jobs:
       - name: Download OpenWrt SDK
         run: |
           set -eu
+          work_dir="$RUNNER_TEMP/openwrt-sdk-${{ matrix.label }}"
+          mkdir -p "$work_dir"
+          cd "$work_dir"
           base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
           index="$(curl -fsSL "$base/")"
           sdk_file="$(printf '%s\n' "$index" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n 1)"
@@ -68,7 +71,7 @@ jobs:
             *.tar.xz) tar -xf "$sdk_file" ;;
             *) echo "Unsupported SDK archive: $sdk_file"; exit 1 ;;
           esac
-          sdk_dir="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
+          sdk_dir="$(find "$work_dir" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
           if [ -z "$sdk_dir" ]; then
             echo "SDK directory not found after extraction"
             exit 1
@@ -88,6 +91,7 @@ jobs:
             --exclude='bin' \
             --exclude='dist' \
             --exclude='release' \
+            --exclude='openwrt-sdk-*' \
             "$GITHUB_WORKSPACE/" "$package_dir/"
 
           cd "$sdk_dir"

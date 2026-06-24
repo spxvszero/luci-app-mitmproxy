@@ -278,7 +278,7 @@ return view.extend({
 							'id': 'mitmproxy-target-value',
 							'class': 'cbi-input-text',
 							'type': 'text',
-							'placeholder': '192.168.1.23 or 2001:db8::123'
+							'placeholder': '192.0.2.10 or 2001:db8::123'
 						})
 					]),
 					E('div', { 'class': 'td left' }, [

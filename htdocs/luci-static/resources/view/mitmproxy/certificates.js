@@ -299,7 +299,7 @@ return view.extend({
 							'class': 'cbi-input-text',
 							'type': 'text',
 							'list': 'mitmproxy-target-ip-list',
-							'placeholder': '192.168.1.23 or 2001:db8::123'
+							'placeholder': '192.0.2.10 or 2001:db8::123'
 						}),
 						E('datalist', { 'id': 'mitmproxy-target-ip-list' }, ipTargets.map(function(target) {
 							return E('option', {
