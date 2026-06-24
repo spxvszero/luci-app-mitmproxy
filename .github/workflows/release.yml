@@ -71,7 +71,7 @@ jobs:
             *.tar.xz) tar -xf "$sdk_file" ;;
             *) echo "Unsupported SDK archive: $sdk_file"; exit 1 ;;
           esac
-          sdk_dir="$(find "$work_dir" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
+          sdk_dir="$(find "$work_dir" -mindepth 1 -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
           if [ -z "$sdk_dir" ]; then
             echo "SDK directory not found after extraction"
             exit 1
