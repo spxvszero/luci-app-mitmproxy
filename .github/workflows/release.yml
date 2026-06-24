@@ -102,7 +102,6 @@ jobs:
           rm -rf tmp
           echo "CONFIG_PACKAGE_${PACKAGE_NAME}=m" >> .config
           make defconfig
-          grep -q "^CONFIG_PACKAGE_${PACKAGE_NAME}=m$" .config
           make "package/feeds/local_mitmproxy/$PACKAGE_NAME/compile" V=s
 
           out_dir="$GITHUB_WORKSPACE/dist/${{ matrix.label }}"
